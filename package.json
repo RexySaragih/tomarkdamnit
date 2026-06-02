@@ -1,0 +1,35 @@
+{
+  "name": "tomarkdamnit",
+  "version": "1.0.0",
+  "description": "MCP server that converts PDF, DOCX, XLSX/XLS, PPTX, and YouTube videos to Markdown",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "tomarkdamnit": "dist/index.js"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node --format esm --external pdf-parse && chmod +x dist/index.js",
+    "dev": "bun run src/index.ts",
+    "start": "bun dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "fflate": "^0.8.3",
+    "https-proxy-agent": "^9.0.0",
+    "mammoth": "^1.8.0",
+    "officeparser": "^4.1.3",
+    "pdf-parse": "^1.1.1",
+    "turndown": "^7.2.0",
+    "xlsx": "^0.18.5",
+    "youtube-transcript": "^1.2.1",
+    "youtubei.js": "^17.0.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/pdf-parse": "^1.1.4",
+    "@types/turndown": "^5.0.4",
+    "typescript": "^5.4.5"
+  }
+}
