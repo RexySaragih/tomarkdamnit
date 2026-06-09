@@ -20,16 +20,10 @@ Supports PDF, DOCX, XLSX/XLS, PPTX, and YouTube transcripts.
 
 ## Installation
 
-Requires [Bun](https://bun.sh) and Node.js.
+No local clone needed. Run directly via `npx`:
 
 ```bash
-# Clone and install dependencies
-git clone https://github.com/your-username/tomarkdamnit.git
-cd tomarkdamnit
-bun install
-
-# Build the binary
-bun run build
+npx -y @rexymayderio/tomarkdamnit
 ```
 
 ---
@@ -44,8 +38,8 @@ Add the server to your `.kiro/settings/mcp.json`:
 {
   "mcpServers": {
     "tomarkdamnit": {
-      "command": "node",
-      "args": ["/absolute/path/to/tomarkdamnit/dist/index.js"]
+      "command": "npx",
+      "args": ["-y", "@rexymayderio/tomarkdamnit"]
     }
   }
 }
@@ -59,8 +53,23 @@ Add it to your `claude_desktop_config.json`:
 {
   "mcpServers": {
     "tomarkdamnit": {
-      "command": "node",
-      "args": ["/absolute/path/to/tomarkdamnit/dist/index.js"]
+      "command": "npx",
+      "args": ["-y", "@rexymayderio/tomarkdamnit"]
+    }
+  }
+}
+```
+
+### Cursor
+
+Add it to your `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "tomarkdamnit": {
+      "command": "npx",
+      "args": ["-y", "@rexymayderio/tomarkdamnit"]
     }
   }
 }
@@ -124,13 +133,18 @@ Supported URL formats:
 - `https://www.youtube.com/shorts/VIDEO_ID`
 - `VIDEO_ID` (bare 11-character ID)
 
-**Proxy support:** If YouTube is blocked on your network, set `HTTPS_PROXY` (or `HTTP_PROXY`) in your environment before starting the server.
+**Proxy support:** If YouTube is blocked on your network, set `HTTPS_PROXY` (or `HTTP_PROXY`) in your MCP config `env` block.
 
 ---
 
 ## Development
 
 ```bash
+# Clone and install
+git clone https://github.com/your-username/tomarkdamnit.git
+cd tomarkdamnit
+bun install
+
 # Run in dev mode (no build step)
 bun run dev
 
@@ -138,7 +152,7 @@ bun run dev
 bun run typecheck
 
 # Build
-bun run build
+npm run build
 ```
 
 ---
