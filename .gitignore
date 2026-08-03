@@ -12,6 +12,9 @@ dist/
 # Bun
 bun.lockb
 
+# npm lockfile (Bun is primary)
+package-lock.json
+
 # OS
 .DS_Store
 Thumbs.db
