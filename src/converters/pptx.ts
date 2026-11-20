@@ -2,7 +2,12 @@ import { getMaxPptxSlides, ZIP_MAGIC } from "../shared/constants.js";
 import { assertReadableFile, readFileBuffer } from "../shared/fs.js";
 import { assertMagic } from "../shared/magic.js";
 import { parseRelationships, resolvePartPath } from "../shared/ooxml.js";
-import { decodeXmlEntities } from "../shared/xml.js";
+import {
+  parseNotesXml,
+  parseSlideXml,
+  type ParsedSlide,
+  type SlideBlock,
+} from "../shared/pptx-xml.js";
 import { unzipOfficePackage } from "../shared/zip.js";
 
 type PackageEntries = Record<string, Uint8Array>;
@@ -75,42 +80,45 @@ function notesPathForSlide(
     : undefined;
 }
 
-function extractTextFromSlideXml(xml: string): string[] {
-  const lines: string[] = [];
-  const paragraphs = xml.match(/<a:p[\s>][\s\S]*?<\/a:p>/g) ?? [];
+const HIDDEN_LABEL = "_(hidden)_";
 
-  for (const para of paragraphs) {
-    const runs = para.match(/<a:t(?:\s[^>]*)?>([\s\S]*?)<\/a:t>/g) ?? [];
-    const text = runs
-      .map((r) => r.replace(/<a:t(?:\s[^>]*)?>/, "").replace(/<\/a:t>/, ""))
-      .map(decodeXmlEntities)
-      .join("");
-    if (text.trim()) lines.push(text.trim());
-  }
+function blockToMarkdown(block: SlideBlock): string {
+  return block.kind === "table" ? block.markdown : block.lines.join("\n");
+}
 
-  return lines;
+/**
+ * Without a title placeholder, fall back to treating the first line as the
+ * title when the slide has more than one line (pre-1.3 behaviour).
+ */
+function splitTitle(slide: ParsedSlide): { title?: string; blocks: SlideBlock[] } {
+  if (slide.title !== undefined) return { title: slide.title, blocks: slide.blocks };
+
+  const [first, ...rest] = slide.blocks;
+  const lineCount = slide.blocks.reduce(
+    (sum, block) => sum + (block.kind === "text" ? block.lines.length : 1),
+    0
+  );
+  if (first?.kind !== "text" || lineCount < 2) return { blocks: slide.blocks };
+
+  const [title, ...remaining] = first.lines;
+  const blocks: SlideBlock[] =
+    remaining.length > 0 ? [{ kind: "text", lines: remaining }, ...rest] : rest;
+  return { title, blocks };
 }
 
 function formatSlideSection(
   slideNum: number,
-  lines: string[],
+  slide: ParsedSlide,
   notes: string[]
 ): string {
-  const parts: string[] = [];
+  const { title, blocks } = splitTitle(slide);
+  const heading = [
+    `## Slide ${slideNum}${title ? `: ${title}` : ""}`,
+    slide.hidden ? ` ${HIDDEN_LABEL}` : "",
+  ].join("");
 
-  if (lines.length === 0) {
-    parts.push(`## Slide ${slideNum}`);
-  } else if (lines.length === 1) {
-    parts.push(`## Slide ${slideNum}\n\n${lines[0]}`);
-  } else {
-    const [title, ...body] = lines;
-    parts.push(`## Slide ${slideNum}: ${title}\n\n${body.join("\n")}`);
-  }
-
-  if (notes.length > 0) {
-    parts.push(`### Notes\n\n${notes.join("\n")}`);
-  }
-
+  const parts = [heading, ...blocks.map(blockToMarkdown)];
+  if (notes.length > 0) parts.push(`### Notes\n\n${notes.join("\n")}`);
   return parts.join("\n\n");
 }
 
@@ -119,13 +127,14 @@ function convertSlide(
   slidePath: string,
   slideNum: number
 ): string | undefined {
-  const lines = extractTextFromSlideXml(readPart(entries, slidePath) ?? "");
+  const slide = parseSlideXml(readPart(entries, slidePath) ?? "");
   const notesPath = notesPathForSlide(entries, slidePath);
   const notesXml = notesPath ? readPart(entries, notesPath) : undefined;
-  const notes = notesXml ? extractTextFromSlideXml(notesXml) : [];
+  const notes = notesXml ? parseNotesXml(notesXml) : [];
 
-  if (lines.length === 0 && notes.length === 0) return undefined;
-  return formatSlideSection(slideNum, lines, notes);
+  const isEmpty = slide.title === undefined && slide.blocks.length === 0;
+  if (isEmpty && notes.length === 0) return undefined;
+  return formatSlideSection(slideNum, slide, notes);
 }
 
 export async function pptxToMarkdown(filepath: string): Promise<string> {

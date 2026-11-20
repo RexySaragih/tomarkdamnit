@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pptxToMarkdown } from "../src/converters/pptx.ts";
 import { parseRelationships, resolvePartPath } from "../src/shared/ooxml.ts";
-import { buildPptx, textShape, type SlideSpec } from "./helpers/pptx.ts";
+import { buildPptx, tableShape, textShape, type SlideSpec } from "./helpers/pptx.ts";
 
 const workDir = mkdtempSync(join(tmpdir(), "tomark-pptx-"));
 let fileCounter = 0;
@@ -48,6 +48,69 @@ describe("pptxToMarkdown slide order", () => {
       [1]
     );
     expect(md).toContain("### Notes\n\nSay this");
+  });
+});
+
+describe("pptxToMarkdown slide content", () => {
+  test("uses the title placeholder even when it is not the first shape", async () => {
+    const md = await convert(
+      [{ file: 1, shapes: textShape("Body first") + textShape("Real Title", "title") }],
+      [1]
+    );
+    expect(md).toContain("## Slide 1: Real Title\n\nBody first");
+  });
+
+  test("accepts centered title placeholders", async () => {
+    const md = await convert([{ file: 1, shapes: textShape("Deck Name", "ctrTitle") }], [1]);
+    expect(md).toContain("## Slide 1: Deck Name");
+  });
+
+  test("converts slide tables to Markdown tables and leaves merged cells empty", async () => {
+    const table = tableShape([
+      ["Region", "Q1"],
+      ["North|East", "10"],
+    ]).replace('<a:tc><a:txBody><a:p><a:r><a:t>10', '<a:tc hMerge="1"><a:txBody><a:p><a:r><a:t>10');
+    const md = await convert(
+      [{ file: 1, shapes: textShape("Sales", "title") + table }],
+      [1]
+    );
+    expect(md).toContain("| Region | Q1 |\n| --- | --- |\n| North\\|East |  |");
+  });
+
+  test("labels hidden slides", async () => {
+    const md = await convert(
+      [{ file: 1, shapes: textShape("Backup", "title"), hidden: true }],
+      [1]
+    );
+    expect(md).toContain("## Slide 1: Backup _(hidden)_");
+  });
+
+  test("drops slide-number, date, and footer placeholders from slides and notes", async () => {
+    const md = await convert(
+      [
+        {
+          file: 1,
+          shapes:
+            textShape("Agenda", "title") +
+            textShape("Item one") +
+            textShape("7", "sldNum") +
+            textShape("1/1/2026", "dt") +
+            textShape("Confidential", "ftr"),
+          notes: textShape("Mention item one", "body") + textShape("7", "sldNum"),
+        },
+      ],
+      [1]
+    );
+    expect(md).toBe("## Slide 1: Agenda\n\nItem one\n\n### Notes\n\nMention item one");
+  });
+
+  test("decodes entities and turns line breaks into spaces", async () => {
+    const shape = textShape("Tom &amp; Jerry").replace(
+      "</a:t></a:r></a:p>",
+      "</a:t></a:r><a:br/><a:r><a:t>forever</a:t></a:r></a:p>"
+    );
+    const md = await convert([{ file: 1, shapes: shape }], [1]);
+    expect(md).toContain("Tom & Jerry forever");
   });
 });
 
