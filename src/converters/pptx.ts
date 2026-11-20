@@ -1,18 +1,14 @@
-import { existsSync, readFileSync } from "fs";
-import { unzipSync } from "fflate";
+import { getMaxPptxSlides, ZIP_MAGIC } from "../shared/constants.js";
+import { assertReadableFile, readFileBuffer } from "../shared/fs.js";
+import { assertMagic } from "../shared/magic.js";
+import { decodeXmlEntities } from "../shared/xml.js";
+import { unzipOfficePackage } from "../shared/zip.js";
 
-/**
- * Minimal XML text extractor — pulls all text from <a:t> tags
- * which is where PowerPoint stores text runs.
- */
 function extractTextFromSlideXml(xml: string): string[] {
   const lines: string[] = [];
-
-  // Each <a:p> is a paragraph
   const paragraphs = xml.match(/<a:p[\s>][\s\S]*?<\/a:p>/g) ?? [];
 
   for (const para of paragraphs) {
-    // Collect all text runs <a:t>...</a:t> within this paragraph
     const runs = para.match(/<a:t(?:\s[^>]*)?>([\s\S]*?)<\/a:t>/g) ?? [];
     const text = runs
       .map((r) => r.replace(/<a:t(?:\s[^>]*)?>/, "").replace(/<\/a:t>/, ""))
@@ -27,35 +23,72 @@ function extractTextFromSlideXml(xml: string): string[] {
   return lines;
 }
 
-function decodeXmlEntities(s: string): string {
-  return s
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) =>
-      String.fromCodePoint(parseInt(h, 16))
-    );
+function parseSlideRels(relsXml: string): string | undefined {
+  const noteRel = relsXml.match(
+    /Target="([^"]*notesSlides\/notesSlide\d+\.xml)"/
+  );
+  return noteRel?.[1];
+}
+
+function resolveNotesPath(target: string): string | undefined {
+  let normalized = target.replace(/\\/g, "/");
+  if (normalized.startsWith("/")) normalized = normalized.slice(1);
+
+  // Relationships are relative to ppt/slides/
+  const baseParts = ["ppt", "slides"];
+  const parts = [...baseParts];
+  for (const segment of normalized.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      if (parts.length === 0) return undefined;
+      parts.pop();
+      continue;
+    }
+    if (segment.includes("\0")) return undefined;
+    parts.push(segment);
+  }
+
+  const resolved = parts.join("/");
+  if (!/^ppt\/notesSlides\/notesSlide\d+\.xml$/.test(resolved)) {
+    return undefined;
+  }
+
+  return resolved;
+}
+
+function formatSlideSection(
+  slideNum: number,
+  lines: string[],
+  notes: string[]
+): string {
+  const parts: string[] = [];
+
+  if (lines.length === 0) {
+    parts.push(`## Slide ${slideNum}`);
+  } else if (lines.length === 1) {
+    parts.push(`## Slide ${slideNum}\n\n${lines[0]}`);
+  } else {
+    const [title, ...body] = lines;
+    parts.push(`## Slide ${slideNum}: ${title}\n\n${body.join("\n")}`);
+  }
+
+  if (notes.length > 0) {
+    parts.push(`### Notes\n\n${notes.join("\n")}`);
+  }
+
+  return parts.join("\n\n");
 }
 
 export async function pptxToMarkdown(filepath: string): Promise<string> {
-  if (!existsSync(filepath)) {
-    throw new Error(`File not found: ${filepath}`);
-  }
+  const absolutePath = await assertReadableFile(filepath, {
+    extensions: [".pptx"],
+  });
 
-  // PPTX is a ZIP archive — extract entirely in memory, no temp files needed
-  const fileBuffer = readFileSync(filepath);
-  let zipEntries: Record<string, Uint8Array>;
+  const fileBuffer = await readFileBuffer(absolutePath);
+  assertMagic(fileBuffer, [ZIP_MAGIC], "PPTX (ZIP/OOXML)");
 
-  try {
-    zipEntries = unzipSync(new Uint8Array(fileBuffer));
-  } catch (err: any) {
-    throw new Error(`Failed to read PPTX file (not a valid ZIP): ${err?.message ?? err}`);
-  }
+  const zipEntries = unzipOfficePackage(fileBuffer);
 
-  // Collect slide XML files: ppt/slides/slide1.xml, slide2.xml, ...
   const slideEntries = Object.entries(zipEntries)
     .filter(([path]) => /^ppt\/slides\/slide\d+\.xml$/.test(path))
     .sort(([a], [b]) => {
@@ -68,28 +101,47 @@ export async function pptxToMarkdown(filepath: string): Promise<string> {
     return "_No slides found in this PPTX._";
   }
 
+  const maxSlides = getMaxPptxSlides();
+  const limited = slideEntries.slice(0, maxSlides);
+  const truncatedSlides = slideEntries.length > maxSlides;
+
+  const decoder = new TextDecoder();
   const sections: string[] = [];
 
-  for (let i = 0; i < slideEntries.length; i++) {
-    const [, data] = slideEntries[i];
-    const xml = new TextDecoder().decode(data);
+  for (let i = 0; i < limited.length; i++) {
+    const [slidePath, data] = limited[i];
+    const xml = decoder.decode(data);
     const lines = extractTextFromSlideXml(xml);
-
-    if (lines.length === 0) continue;
-
-    const [title, ...body] = lines;
     const slideNum = i + 1;
 
-    if (body.length > 0) {
-      sections.push(`## Slide ${slideNum}: ${title}\n\n${body.join("\n")}`);
-    } else {
-      sections.push(`## Slide ${slideNum}: ${title}`);
+    let notes: string[] = [];
+    const slideId = slidePath.match(/slide(\d+)\.xml$/)?.[1];
+    const relsPath = `ppt/slides/_rels/slide${slideId}.xml.rels`;
+    const relsData = zipEntries[relsPath];
+    if (relsData) {
+      const target = parseSlideRels(decoder.decode(relsData));
+      if (target) {
+        const notesPath = resolveNotesPath(target);
+        if (notesPath) {
+          const notesData = zipEntries[notesPath];
+          if (notesData) {
+            notes = extractTextFromSlideXml(decoder.decode(notesData));
+          }
+        }
+      }
     }
+
+    if (lines.length === 0 && notes.length === 0) continue;
+    sections.push(formatSlideSection(slideNum, lines, notes));
   }
 
   if (sections.length === 0) {
     return "_No extractable text found in this PPTX._";
   }
 
-  return sections.join("\n\n---\n\n");
+  let result = sections.join("\n\n---\n\n");
+  if (truncatedSlides) {
+    result += `\n\n_Slides truncated to ${maxSlides.toLocaleString()} slides._`;
+  }
+  return result;
 }

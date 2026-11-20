@@ -1,139 +1,157 @@
 import { YoutubeTranscript } from "youtube-transcript";
-import { HttpsProxyAgent } from "https-proxy-agent";
+import { ProxyAgent, fetch as undiciFetch } from "undici";
+import {
+  getYoutubeTimeoutMs,
+  YOUTUBE_CHUNK_SECONDS_DEFAULT,
+} from "../shared/constants.js";
+import { extractVideoId, formatTimestamp } from "../shared/youtube-url.js";
 
-function extractVideoId(input: string): string {
-  // Already a bare video ID (11 chars, alphanumeric + _ -)
-  if (/^[a-zA-Z0-9_-]{11}$/.test(input)) {
-    return input;
-  }
+export { extractVideoId, formatTimestamp } from "../shared/youtube-url.js";
 
-  try {
-    const url = new URL(input);
-
-    // Standard: https://www.youtube.com/watch?v=VIDEO_ID
-    if (url.hostname.includes("youtube.com")) {
-      const v = url.searchParams.get("v");
-      if (v) return v;
-
-      // Shorts: https://www.youtube.com/shorts/VIDEO_ID
-      const shortsMatch = url.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
-      if (shortsMatch) return shortsMatch[1];
-
-      // Embed: https://www.youtube.com/embed/VIDEO_ID
-      const embedMatch = url.pathname.match(/\/embed\/([a-zA-Z0-9_-]{11})/);
-      if (embedMatch) return embedMatch[1];
-    }
-
-    // Shortened: https://youtu.be/VIDEO_ID
-    if (url.hostname === "youtu.be") {
-      const id = url.pathname.replace("/", "");
-      if (id) return id;
-    }
-  } catch {
-    // Not a valid URL — fall through
-  }
-
-  throw new Error(
-    `Cannot extract a YouTube video ID from: "${input}". ` +
-      `Provide a full YouTube URL or an 11-character video ID.`
-  );
+interface TranscriptSegment {
+  text: string;
+  offset: number;
+  duration: number;
 }
 
-/**
- * Build a proxy-aware fetch function if HTTPS_PROXY or https_proxy is set.
- * Falls back to the global fetch if no proxy is configured.
- */
-function buildFetch(): typeof fetch {
-  const proxyUrl =
+function getProxyUrl(): string | undefined {
+  return (
     process.env.HTTPS_PROXY ||
     process.env.https_proxy ||
     process.env.HTTP_PROXY ||
-    process.env.http_proxy;
-
-  if (!proxyUrl) {
-    return fetch;
-  }
-
-  const agent = new HttpsProxyAgent(proxyUrl);
-
-  return (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    return fetch(input, { ...init, dispatcher: agent } as any);
-  };
+    process.env.http_proxy ||
+    undefined
+  );
 }
 
-export async function youtubeToMarkdown(
-  urlOrId: string,
-  lang = "en"
-): Promise<string> {
-  const videoId = extractVideoId(urlOrId);
-  const fetchFn = buildFetch();
+function buildFetch(): typeof fetch {
+  const proxyUrl = getProxyUrl();
+  const timeoutMs = getYoutubeTimeoutMs();
 
-  let segments: { text: string; offset: number; duration: number }[];
+  const withTimeout = (
+    input: RequestInfo | URL,
+    init?: RequestInit
+  ): Promise<Response> => {
+    const signal = AbortSignal.timeout(timeoutMs);
+    const merged: RequestInit = {
+      ...init,
+      signal: init?.signal
+        ? AbortSignal.any([init.signal, signal])
+        : signal,
+    };
 
+    if (!proxyUrl) {
+      return fetch(input, merged);
+    }
+
+    const agent = new ProxyAgent(proxyUrl);
+    return undiciFetch(
+      input as Parameters<typeof undiciFetch>[0],
+      {
+        ...(merged as object),
+        dispatcher: agent,
+      } as Parameters<typeof undiciFetch>[1]
+    ) as unknown as Promise<Response>;
+  };
+
+  return withTimeout as typeof fetch;
+}
+
+function isLanguageMissingError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("Could not find") ||
+    message.includes("No transcript") ||
+    message.includes("not available")
+  );
+}
+
+function isTimeoutError(error: unknown): boolean {
+  if (error instanceof Error && error.name === "TimeoutError") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("TimeoutError") ||
+    message.includes("The operation was aborted") ||
+    message.includes("aborted due to timeout")
+  );
+}
+
+function isNetworkError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("fetch failed") ||
+    message.includes("ECONNRESET") ||
+    message.includes("ETIMEDOUT") ||
+    message.includes("Connect Timeout") ||
+    message.includes("certificate")
+  );
+}
+
+async function fetchSegments(
+  videoId: string,
+  lang: string,
+  fetchFn: typeof fetch
+): Promise<TranscriptSegment[]> {
   try {
-    segments = await YoutubeTranscript.fetchTranscript(videoId, {
+    return await YoutubeTranscript.fetchTranscript(videoId, {
       lang,
       fetch: fetchFn,
     });
-  } catch (err: any) {
-    // If preferred language not found, retry without language preference
-    if (
-      err?.message?.includes("Could not find") ||
-      err?.message?.includes("No transcript") ||
-      err?.message?.includes("not available")
-    ) {
-      try {
-        segments = await YoutubeTranscript.fetchTranscript(videoId, {
-          fetch: fetchFn,
-        });
-      } catch (fallbackErr: any) {
-        throw new Error(
-          `Could not fetch transcript for video "${videoId}": ${fallbackErr?.message ?? fallbackErr}`
-        );
-      }
-    } else {
-      const isNetworkError =
-        err?.message?.includes("fetch failed") ||
-        err?.message?.includes("ECONNRESET") ||
-        err?.message?.includes("ETIMEDOUT") ||
-        err?.message?.includes("Connect Timeout") ||
-        err?.message?.includes("certificate");
+  } catch (err: unknown) {
+    if (isTimeoutError(err)) {
+      const seconds = Math.round(getYoutubeTimeoutMs() / 1000);
+      throw new Error(
+        `YouTube transcript fetch timed out after ${seconds}s for video "${videoId}".`
+      );
+    }
 
-      if (isNetworkError) {
-        const proxyHint = !(
-          process.env.HTTPS_PROXY ||
-          process.env.https_proxy ||
-          process.env.HTTP_PROXY ||
-          process.env.http_proxy
-        )
+    if (!isLanguageMissingError(err)) {
+      if (isNetworkError(err)) {
+        const proxyHint = !getProxyUrl()
           ? " If YouTube is blocked on your network, set the HTTPS_PROXY environment variable to route traffic through a proxy."
           : " The configured proxy may be unreachable or rejecting the connection.";
-
         throw new Error(
           `Failed to reach YouTube for video "${videoId}". This is likely a network/firewall issue.${proxyHint}`
         );
       }
-
+      const message = err instanceof Error ? err.message : String(err);
       throw new Error(
-        `Failed to fetch YouTube transcript for "${videoId}": ${err?.message ?? err}`
+        `Failed to fetch YouTube transcript for "${videoId}": ${message}`
+      );
+    }
+
+    try {
+      return await YoutubeTranscript.fetchTranscript(videoId, {
+        fetch: fetchFn,
+      });
+    } catch (fallbackErr: unknown) {
+      if (isTimeoutError(fallbackErr)) {
+        const seconds = Math.round(getYoutubeTimeoutMs() / 1000);
+        throw new Error(
+          `YouTube transcript fetch timed out after ${seconds}s for video "${videoId}".`
+        );
+      }
+      const message =
+        fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+      throw new Error(
+        `Could not fetch transcript for video "${videoId}": ${message}`
       );
     }
   }
+}
 
-  if (!segments || segments.length === 0) {
-    return "_No transcript available for this video._";
-  }
-
-  // Format as timestamped markdown paragraphs
-  // Group segments into ~30-second chunks for readability
+function formatChunks(
+  segments: TranscriptSegment[],
+  chunkSeconds: number
+): string {
+  const chunkDurationMs = chunkSeconds * 1000;
   const chunks: { timestamp: string; text: string }[] = [];
   let chunkText = "";
   let chunkStart = segments[0].offset;
-  const CHUNK_DURATION_MS = 30_000;
 
   for (const seg of segments) {
     const elapsed = seg.offset - chunkStart;
-    if (elapsed >= CHUNK_DURATION_MS && chunkText.trim()) {
+    if (elapsed >= chunkDurationMs && chunkText.trim()) {
       chunks.push({
         timestamp: formatTimestamp(chunkStart),
         text: chunkText.trim(),
@@ -144,6 +162,7 @@ export async function youtubeToMarkdown(
       chunkText += (chunkText ? " " : "") + seg.text;
     }
   }
+
   if (chunkText.trim()) {
     chunks.push({
       timestamp: formatTimestamp(chunkStart),
@@ -151,21 +170,29 @@ export async function youtubeToMarkdown(
     });
   }
 
-  const header = `# YouTube Transcript\n\n**Video ID:** ${videoId}  \n**URL:** https://www.youtube.com/watch?v=${videoId}\n\n---\n\n`;
-
-  const body = chunks.map((c) => `**[${c.timestamp}]** ${c.text}`).join("\n\n");
-
-  return header + body;
+  return chunks.map((c) => `**[${c.timestamp}]** ${c.text}`).join("\n\n");
 }
 
-function formatTimestamp(ms: number): string {
-  const totalSeconds = Math.floor(ms / 1000);
-  const h = Math.floor(totalSeconds / 3600);
-  const m = Math.floor((totalSeconds % 3600) / 60);
-  const s = totalSeconds % 60;
+export async function youtubeToMarkdown(
+  urlOrId: string,
+  lang = "en",
+  chunkSeconds = YOUTUBE_CHUNK_SECONDS_DEFAULT
+): Promise<string> {
+  const videoId = extractVideoId(urlOrId);
+  const fetchFn = buildFetch();
+  const segments = await fetchSegments(videoId, lang, fetchFn);
 
-  if (h > 0) {
-    return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  if (!segments || segments.length === 0) {
+    return "_No transcript available for this video._";
   }
-  return `${m}:${String(s).padStart(2, "0")}`;
+
+  const safeChunkSeconds =
+    Number.isFinite(chunkSeconds) && chunkSeconds > 0
+      ? chunkSeconds
+      : YOUTUBE_CHUNK_SECONDS_DEFAULT;
+
+  const header = `# YouTube Transcript\n\n**Video ID:** ${videoId}  \n**URL:** https://www.youtube.com/watch?v=${videoId}\n\n---\n\n`;
+  const body = formatChunks(segments, safeChunkSeconds);
+
+  return header + body;
 }

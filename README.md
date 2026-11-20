@@ -1,20 +1,26 @@
+<p align="center">
+  <img src="assets/tomarkdamnit-github-logo.png" alt="tomarkdamnit" width="180" height="180" />
+</p>
+
 # tomarkdamnit
 
 An MCP (Model Context Protocol) server that converts documents and YouTube videos to Markdown — right inside your AI assistant.
 
-Supports PDF, DOCX, XLSX/XLS, PPTX, and YouTube transcripts.
+Supports PDF, DOCX, XLSX, PPTX, and YouTube transcripts.
+
+Requires **Node.js >= 20.18.1**.
 
 ---
 
 ## Tools
 
-| Tool                  | Input          | What it does                                                                               |
-| --------------------- | -------------- | ------------------------------------------------------------------------------------------ |
-| `pdf_to_markdown`     | `filepath`     | Extracts all text from a PDF and returns it as Markdown                                    |
-| `docx_to_markdown`    | `filepath`     | Converts a Word document to Markdown, preserving headings, bold, italic, lists, and tables |
-| `xlsx_to_markdown`    | `filepath`     | Converts an Excel file to Markdown — each sheet becomes a table                            |
-| `pptx_to_markdown`    | `filepath`     | Extracts slide titles and body text from a PowerPoint file                                 |
-| `youtube_to_markdown` | `url`, `lang?` | Fetches a YouTube transcript and returns it as timestamped Markdown                        |
+| Tool                  | Input                           | What it does                                                                               |
+| --------------------- | ------------------------------- | ------------------------------------------------------------------------------------------ |
+| `pdf_to_markdown`     | `filepath`                      | Extracts plain text from a PDF (no OCR / layout reconstruction)                            |
+| `docx_to_markdown`    | `filepath`                      | Converts a Word document to Markdown, preserving headings, bold, italic, lists, and tables |
+| `xlsx_to_markdown`    | `filepath`                      | Converts an Excel workbook (`.xlsx`/`.xlsm`/`.xls`) to Markdown — each sheet becomes a table |
+| `pptx_to_markdown`    | `filepath`                      | Extracts slide text and speaker notes from a PowerPoint file                               |
+| `youtube_to_markdown` | `url`, `lang?`, `chunkSeconds?` | Fetches a YouTube transcript and returns it as timestamped Markdown                        |
 
 ---
 
@@ -30,9 +36,7 @@ npx -y @rexymayderio/tomarkdamnit
 
 ## Usage with an MCP client
 
-### Kiro
-
-Add the server to your `.kiro/settings/mcp.json`:
+### Cursor
 
 ```json
 {
@@ -47,8 +51,6 @@ Add the server to your `.kiro/settings/mcp.json`:
 
 ### Claude Desktop
 
-Add it to your `claude_desktop_config.json`:
-
 ```json
 {
   "mcpServers": {
@@ -60,22 +62,7 @@ Add it to your `claude_desktop_config.json`:
 }
 ```
 
-### Cursor
-
-Add it to your `.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "tomarkdamnit": {
-      "command": "npx",
-      "args": ["-y", "@rexymayderio/tomarkdamnit"]
-    }
-  }
-}
-```
-
-Once configured, the tools are available in your AI chat. For example:
+Once configured:
 
 > "Convert `/Users/me/reports/q1.pdf` to Markdown"
 
@@ -83,76 +70,82 @@ Once configured, the tools are available in your AI chat. For example:
 
 ---
 
-## Tool Details
+## Environment variables
+
+| Variable | Purpose |
+| -------- | ------- |
+| `TOMARK_ALLOWED_DIRS` | Optional comma-separated absolute directories. When set, file tools only read **realpath** targets inside these dirs. Symlinks are rejected. |
+| `TOMARK_MAX_FILE_BYTES` | Max input file size (default `52428800` / 50 MiB) |
+| `TOMARK_MAX_OUTPUT_CHARS` | Max Markdown output length (default `500000`) |
+| `TOMARK_MAX_CONCURRENT` | Max concurrent tool executions (default `2`) |
+| `TOMARK_YOUTUBE_TIMEOUT_MS` | YouTube fetch timeout (default `30000`) |
+| `TOMARK_MAX_ZIP_ENTRIES` | Max ZIP entries for PPTX (default `5000`) |
+| `TOMARK_MAX_ZIP_UNCOMPRESSED_BYTES` | Max uncompressed ZIP bytes (default `209715200` / 200 MiB) |
+| `TOMARK_MAX_PPTX_SLIDES` | Max slides to convert (default `500`) |
+| `TOMARK_DEBUG` | Set to `1`/`true` to log converter errors to stderr |
+| `HTTPS_PROXY` / `HTTP_PROXY` | Optional proxy for YouTube transcript fetches (undici `ProxyAgent`) |
+
+Also accepts lowercase `https_proxy` / `http_proxy`.
+
+---
+
+## Tool details
 
 ### `pdf_to_markdown`
 
-Extracts plain text from a PDF. Image-based (scanned) PDFs without embedded text will return a notice rather than empty output.
-
-```
-filepath  — Absolute path to the .pdf file
-```
+Extracts plain text from a PDF. Scanned PDFs without embedded text return a notice. Layout/headings are not reconstructed; OCR is not performed. Path must be absolute. File must start with `%PDF`.
 
 ### `docx_to_markdown`
 
-Converts Word documents using [mammoth](https://github.com/mwilliamson/mammoth.js) and [Turndown](https://github.com/mixmark-io/turndown). Tables are preserved as Markdown tables.
-
-```
-filepath  — Absolute path to the .docx file
-```
+Converts `.docx` via [mammoth](https://github.com/mwilliamson/mammoth.js) + [Turndown](https://github.com/mixmark-io/turndown). Legacy `.doc` is not supported. Nested tables are handled without flattening into the parent row.
 
 ### `xlsx_to_markdown`
 
-Converts Excel spreadsheets using [xlsx](https://github.com/SheetJS/sheetjs). Each worksheet becomes its own Markdown table section.
-
-```
-filepath  — Absolute path to the .xlsx or .xls file
-```
+Converts `.xlsx` / `.xlsm` via [exceljs](https://github.com/exceljs/exceljs), and legacy `.xls` (BIFF5/BIFF8 OLE) via [xlsjs](https://www.npmjs.com/package/xlsjs). Format is detected from file magic bytes (so a renamed `.xlsx` that is still OLE/BIFF is handled correctly). Each worksheet becomes a Markdown table. Rows/columns are capped (5000 × 100 by default).
 
 ### `pptx_to_markdown`
 
-Extracts text from PowerPoint presentations using [officeparser](https://github.com/harshankur/officeParser). Slide structure (titles, bullets) is preserved.
-
-```
-filepath  — Absolute path to the .pptx file
-```
+Reads the PPTX ZIP via [fflate](https://github.com/101arrowz/fflate), extracts slide text runs and speaker notes. ZIP entry/uncompressed size limits apply.
 
 ### `youtube_to_markdown`
 
-Fetches a YouTube transcript and formats it as timestamped paragraphs grouped in ~30-second chunks. Falls back to any available language if the requested one isn't found.
+Fetches a transcript as timestamped paragraphs (`chunkSeconds` default 30, range 5–300).
 
-```
-url   — Full YouTube URL or bare 11-character video ID
-lang  — (optional) Language code, e.g. "en", "id". Defaults to "en"
-```
-
-Supported URL formats:
+Supported URL forms:
 
 - `https://www.youtube.com/watch?v=VIDEO_ID`
 - `https://youtu.be/VIDEO_ID`
-- `https://www.youtube.com/shorts/VIDEO_ID`
-- `VIDEO_ID` (bare 11-character ID)
+- `https://www.youtube.com/shorts|embed|live|clip/VIDEO_ID`
+- `https://www.youtube-nocookie.com/embed/VIDEO_ID`
+- `https://music.youtube.com/watch?v=VIDEO_ID`
+- bare 11-character video ID
 
-**Proxy support:** If YouTube is blocked on your network, set `HTTPS_PROXY` (or `HTTP_PROXY`) in your MCP config `env` block.
+Spoof hosts (e.g. `notyoutube.com`) are rejected.
+
+---
+
+## Limitations
+
+- PDF: plain-text extraction only (no OCR, no layout reconstruction)
+- DOCX: `.docx` only (not `.doc`)
+- XLSX: `.xlsx`/`.xlsm` via exceljs; legacy `.xls` via xlsjs
+- PPTX: text runs + notes; charts/SmartArt not interpreted
+- File paths must be absolute; symlinks are rejected
+- Large files / sheets / ZIPs are capped (see env vars)
 
 ---
 
 ## Development
 
 ```bash
-# Clone and install
-git clone https://github.com/your-username/tomarkdamnit.git
+git clone https://github.com/RexySaragih/tomarkdamnit.git
 cd tomarkdamnit
 bun install
 
-# Run in dev mode (no build step)
 bun run dev
-
-# Type-check
 bun run typecheck
-
-# Build
-npm run build
+bun test
+bun run build
 ```
 
 ---
