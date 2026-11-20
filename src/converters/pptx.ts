@@ -1,146 +1,163 @@
 import { getMaxPptxSlides, ZIP_MAGIC } from "../shared/constants.js";
 import { assertReadableFile, readFileBuffer } from "../shared/fs.js";
 import { assertMagic } from "../shared/magic.js";
-import { decodeXmlEntities } from "../shared/xml.js";
+import { parseRelationships, resolvePartPath } from "../shared/ooxml.js";
+import {
+  parseNotesXml,
+  parseSlideXml,
+  type ParsedSlide,
+  type SlideBlock,
+} from "../shared/pptx-xml.js";
 import { unzipOfficePackage } from "../shared/zip.js";
 
-function extractTextFromSlideXml(xml: string): string[] {
-  const lines: string[] = [];
-  const paragraphs = xml.match(/<a:p[\s>][\s\S]*?<\/a:p>/g) ?? [];
+type PackageEntries = Record<string, Uint8Array>;
 
-  for (const para of paragraphs) {
-    const runs = para.match(/<a:t(?:\s[^>]*)?>([\s\S]*?)<\/a:t>/g) ?? [];
-    const text = runs
-      .map((r) => r.replace(/<a:t(?:\s[^>]*)?>/, "").replace(/<\/a:t>/, ""))
-      .map(decodeXmlEntities)
-      .join("");
+// Media (images, video, embedded workbooks) is never needed for text output.
+const TEXT_PART_PATTERN =
+  /^ppt\/(presentation\.xml|_rels\/presentation\.xml\.rels|slides\/(_rels\/)?slide\d+\.xml(\.rels)?|notesSlides\/notesSlide\d+\.xml)$/;
+const SLIDE_PATH = /^ppt\/slides\/slide\d+\.xml$/;
+const NOTES_PATH = /^ppt\/notesSlides\/notesSlide\d+\.xml$/;
+const SLIDE_ID_TAG = /<p:sldId\b[^>]*\br:id="([^"]+)"/g;
+const NOTES_REL_TYPE = /\/notesSlide$/;
 
-    if (text.trim()) {
-      lines.push(text.trim());
-    }
-  }
+const decoder = new TextDecoder();
 
-  return lines;
+function isTextPart(entryName: string): boolean {
+  return TEXT_PART_PATTERN.test(entryName);
 }
 
-function parseSlideRels(relsXml: string): string | undefined {
-  const noteRel = relsXml.match(
-    /Target="([^"]*notesSlides\/notesSlide\d+\.xml)"/
+function readPart(entries: PackageEntries, path: string): string | undefined {
+  const data = entries[path];
+  return data ? decoder.decode(data) : undefined;
+}
+
+function slideFileNumber(path: string): number {
+  return parseInt(path.match(/slide(\d+)\.xml$/)?.[1] ?? "0", 10);
+}
+
+function slidesByFileName(entries: PackageEntries): string[] {
+  return Object.keys(entries)
+    .filter((path) => SLIDE_PATH.test(path))
+    .sort((a, b) => slideFileNumber(a) - slideFileNumber(b));
+}
+
+/**
+ * Presentation order lives in presentation.xml (p:sldIdLst), not in slide
+ * file names; reordered decks keep their original file numbers.
+ */
+function slidesInPresentationOrder(entries: PackageEntries): string[] {
+  const presentation = readPart(entries, "ppt/presentation.xml");
+  const rels = readPart(entries, "ppt/_rels/presentation.xml.rels");
+  if (!presentation || !rels) return slidesByFileName(entries);
+
+  const targets = new Map(
+    parseRelationships(rels).map((rel) => [rel.id, rel.target])
   );
-  return noteRel?.[1];
+  const ordered: string[] = [];
+  for (const [, relId] of presentation.matchAll(SLIDE_ID_TAG)) {
+    const target = targets.get(relId);
+    const path = target && resolvePartPath("ppt", target, SLIDE_PATH);
+    if (path && entries[path] && !ordered.includes(path)) ordered.push(path);
+  }
+  return ordered.length > 0 ? ordered : slidesByFileName(entries);
 }
 
-function resolveNotesPath(target: string): string | undefined {
-  let normalized = target.replace(/\\/g, "/");
-  if (normalized.startsWith("/")) normalized = normalized.slice(1);
+function notesPathForSlide(
+  entries: PackageEntries,
+  slidePath: string
+): string | undefined {
+  const relsPath = slidePath.replace(
+    /slides\/(slide\d+\.xml)$/,
+    "slides/_rels/$1.rels"
+  );
+  const rels = readPart(entries, relsPath);
+  if (!rels) return undefined;
+  const notesRel = parseRelationships(rels).find(
+    (rel) => !rel.external && NOTES_REL_TYPE.test(rel.type)
+  );
+  return notesRel
+    ? resolvePartPath("ppt/slides", notesRel.target, NOTES_PATH)
+    : undefined;
+}
 
-  // Relationships are relative to ppt/slides/
-  const baseParts = ["ppt", "slides"];
-  const parts = [...baseParts];
-  for (const segment of normalized.split("/")) {
-    if (!segment || segment === ".") continue;
-    if (segment === "..") {
-      if (parts.length === 0) return undefined;
-      parts.pop();
-      continue;
-    }
-    if (segment.includes("\0")) return undefined;
-    parts.push(segment);
-  }
+const HIDDEN_LABEL = "_(hidden)_";
 
-  const resolved = parts.join("/");
-  if (!/^ppt\/notesSlides\/notesSlide\d+\.xml$/.test(resolved)) {
-    return undefined;
-  }
+function blockToMarkdown(block: SlideBlock): string {
+  return block.kind === "table" ? block.markdown : block.lines.join("\n");
+}
 
-  return resolved;
+/**
+ * Without a title placeholder, fall back to treating the first line as the
+ * title when the slide has more than one line (pre-1.3 behaviour).
+ */
+function splitTitle(slide: ParsedSlide): { title?: string; blocks: SlideBlock[] } {
+  if (slide.title !== undefined) return { title: slide.title, blocks: slide.blocks };
+
+  const [first, ...rest] = slide.blocks;
+  const lineCount = slide.blocks.reduce(
+    (sum, block) => sum + (block.kind === "text" ? block.lines.length : 1),
+    0
+  );
+  if (first?.kind !== "text" || lineCount < 2) return { blocks: slide.blocks };
+
+  const [title, ...remaining] = first.lines;
+  const blocks: SlideBlock[] =
+    remaining.length > 0 ? [{ kind: "text", lines: remaining }, ...rest] : rest;
+  return { title, blocks };
 }
 
 function formatSlideSection(
   slideNum: number,
-  lines: string[],
+  slide: ParsedSlide,
   notes: string[]
 ): string {
-  const parts: string[] = [];
+  const { title, blocks } = splitTitle(slide);
+  const heading = [
+    `## Slide ${slideNum}${title ? `: ${title}` : ""}`,
+    slide.hidden ? ` ${HIDDEN_LABEL}` : "",
+  ].join("");
 
-  if (lines.length === 0) {
-    parts.push(`## Slide ${slideNum}`);
-  } else if (lines.length === 1) {
-    parts.push(`## Slide ${slideNum}\n\n${lines[0]}`);
-  } else {
-    const [title, ...body] = lines;
-    parts.push(`## Slide ${slideNum}: ${title}\n\n${body.join("\n")}`);
-  }
-
-  if (notes.length > 0) {
-    parts.push(`### Notes\n\n${notes.join("\n")}`);
-  }
-
+  const parts = [heading, ...blocks.map(blockToMarkdown)];
+  if (notes.length > 0) parts.push(`### Notes\n\n${notes.join("\n")}`);
   return parts.join("\n\n");
+}
+
+function convertSlide(
+  entries: PackageEntries,
+  slidePath: string,
+  slideNum: number
+): string | undefined {
+  const slide = parseSlideXml(readPart(entries, slidePath) ?? "");
+  const notesPath = notesPathForSlide(entries, slidePath);
+  const notesXml = notesPath ? readPart(entries, notesPath) : undefined;
+  const notes = notesXml ? parseNotesXml(notesXml) : [];
+
+  const isEmpty = slide.title === undefined && slide.blocks.length === 0;
+  if (isEmpty && notes.length === 0) return undefined;
+  return formatSlideSection(slideNum, slide, notes);
 }
 
 export async function pptxToMarkdown(filepath: string): Promise<string> {
   const absolutePath = await assertReadableFile(filepath, {
     extensions: [".pptx"],
   });
-
   const fileBuffer = await readFileBuffer(absolutePath);
   assertMagic(fileBuffer, [ZIP_MAGIC], "PPTX (ZIP/OOXML)");
 
-  const zipEntries = unzipOfficePackage(fileBuffer);
-
-  const slideEntries = Object.entries(zipEntries)
-    .filter(([path]) => /^ppt\/slides\/slide\d+\.xml$/.test(path))
-    .sort(([a], [b]) => {
-      const numA = parseInt(a.match(/slide(\d+)\.xml$/)?.[1] ?? "0", 10);
-      const numB = parseInt(b.match(/slide(\d+)\.xml$/)?.[1] ?? "0", 10);
-      return numA - numB;
-    });
-
-  if (slideEntries.length === 0) {
-    return "_No slides found in this PPTX._";
-  }
+  const entries = unzipOfficePackage(fileBuffer, { include: isTextPart });
+  const slidePaths = slidesInPresentationOrder(entries);
+  if (slidePaths.length === 0) return "_No slides found in this PPTX._";
 
   const maxSlides = getMaxPptxSlides();
-  const limited = slideEntries.slice(0, maxSlides);
-  const truncatedSlides = slideEntries.length > maxSlides;
+  const sections = slidePaths
+    .slice(0, maxSlides)
+    .map((path, index) => convertSlide(entries, path, index + 1))
+    .filter((section): section is string => section !== undefined);
 
-  const decoder = new TextDecoder();
-  const sections: string[] = [];
-
-  for (let i = 0; i < limited.length; i++) {
-    const [slidePath, data] = limited[i];
-    const xml = decoder.decode(data);
-    const lines = extractTextFromSlideXml(xml);
-    const slideNum = i + 1;
-
-    let notes: string[] = [];
-    const slideId = slidePath.match(/slide(\d+)\.xml$/)?.[1];
-    const relsPath = `ppt/slides/_rels/slide${slideId}.xml.rels`;
-    const relsData = zipEntries[relsPath];
-    if (relsData) {
-      const target = parseSlideRels(decoder.decode(relsData));
-      if (target) {
-        const notesPath = resolveNotesPath(target);
-        if (notesPath) {
-          const notesData = zipEntries[notesPath];
-          if (notesData) {
-            notes = extractTextFromSlideXml(decoder.decode(notesData));
-          }
-        }
-      }
-    }
-
-    if (lines.length === 0 && notes.length === 0) continue;
-    sections.push(formatSlideSection(slideNum, lines, notes));
-  }
-
-  if (sections.length === 0) {
-    return "_No extractable text found in this PPTX._";
-  }
+  if (sections.length === 0) return "_No extractable text found in this PPTX._";
 
   let result = sections.join("\n\n---\n\n");
-  if (truncatedSlides) {
+  if (slidePaths.length > maxSlides) {
     result += `\n\n_Slides truncated to ${maxSlides.toLocaleString()} slides._`;
   }
   return result;

@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+// Must be the first import: ESM evaluates imports in order, so the console is
+// redirected before any converter library loads.
+import "./shared/stdout-guard.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer } from "./server.js";
 

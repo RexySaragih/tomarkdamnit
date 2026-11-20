@@ -1,18 +1,39 @@
-import { YoutubeTranscript } from "youtube-transcript";
+import {
+  YoutubeTranscript,
+  YoutubeTranscriptNotAvailableLanguageError,
+  type TranscriptResponse,
+} from "youtube-transcript";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import {
   getYoutubeTimeoutMs,
   YOUTUBE_CHUNK_SECONDS_DEFAULT,
 } from "../shared/constants.js";
+import { errorMessage } from "../shared/errors.js";
 import { extractVideoId, formatTimestamp } from "../shared/youtube-url.js";
 
 export { extractVideoId, formatTimestamp } from "../shared/youtube-url.js";
 
-interface TranscriptSegment {
-  text: string;
-  offset: number;
-  duration: number;
+interface TranscriptResult {
+  segments: TranscriptResponse[];
+  requestedLang: string;
+  usedFallback: boolean;
 }
+
+const MS_PER_SECOND = 1000;
+const NETWORK_ERROR_MARKERS = [
+  "fetch failed",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "Connect Timeout",
+  "certificate",
+];
+const TIMEOUT_ERROR_MARKERS = [
+  "TimeoutError",
+  "The operation was aborted",
+  "aborted due to timeout",
+];
+
+let cachedAgent: { url: string; agent: ProxyAgent } | undefined;
 
 function getProxyUrl(): string | undefined {
   return (
@@ -24,6 +45,14 @@ function getProxyUrl(): string | undefined {
   );
 }
 
+/** One connection pool per proxy URL; creating an agent per request leaks sockets. */
+export function getProxyAgent(proxyUrl: string): ProxyAgent {
+  if (cachedAgent?.url !== proxyUrl) {
+    cachedAgent = { url: proxyUrl, agent: new ProxyAgent(proxyUrl) };
+  }
+  return cachedAgent.agent;
+}
+
 function buildFetch(): typeof fetch {
   const proxyUrl = getProxyUrl();
   const timeoutMs = getYoutubeTimeoutMs();
@@ -32,24 +61,16 @@ function buildFetch(): typeof fetch {
     input: RequestInfo | URL,
     init?: RequestInit
   ): Promise<Response> => {
-    const signal = AbortSignal.timeout(timeoutMs);
-    const merged: RequestInit = {
-      ...init,
-      signal: init?.signal
-        ? AbortSignal.any([init.signal, signal])
-        : signal,
-    };
+    const timeout = AbortSignal.timeout(timeoutMs);
+    const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+    const merged: RequestInit = { ...init, signal };
+    if (!proxyUrl) return fetch(input, merged);
 
-    if (!proxyUrl) {
-      return fetch(input, merged);
-    }
-
-    const agent = new ProxyAgent(proxyUrl);
     return undiciFetch(
       input as Parameters<typeof undiciFetch>[0],
       {
         ...(merged as object),
-        dispatcher: agent,
+        dispatcher: getProxyAgent(proxyUrl),
       } as Parameters<typeof undiciFetch>[1]
     ) as unknown as Promise<Response>;
   };
@@ -57,33 +78,33 @@ function buildFetch(): typeof fetch {
   return withTimeout as typeof fetch;
 }
 
-function isLanguageMissingError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return (
-    message.includes("Could not find") ||
-    message.includes("No transcript") ||
-    message.includes("not available")
-  );
+function messageHasAny(error: unknown, markers: string[]): boolean {
+  const message = errorMessage(error);
+  return markers.some((marker) => message.includes(marker));
 }
 
 function isTimeoutError(error: unknown): boolean {
   if (error instanceof Error && error.name === "TimeoutError") return true;
-  const message = error instanceof Error ? error.message : String(error);
-  return (
-    message.includes("TimeoutError") ||
-    message.includes("The operation was aborted") ||
-    message.includes("aborted due to timeout")
-  );
+  return messageHasAny(error, TIMEOUT_ERROR_MARKERS);
 }
 
-function isNetworkError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return (
-    message.includes("fetch failed") ||
-    message.includes("ECONNRESET") ||
-    message.includes("ETIMEDOUT") ||
-    message.includes("Connect Timeout") ||
-    message.includes("certificate")
+function normalizeFetchError(error: unknown, videoId: string): Error {
+  if (isTimeoutError(error)) {
+    const seconds = Math.round(getYoutubeTimeoutMs() / MS_PER_SECOND);
+    return new Error(
+      `YouTube transcript fetch timed out after ${seconds}s for video "${videoId}".`
+    );
+  }
+  if (messageHasAny(error, NETWORK_ERROR_MARKERS)) {
+    const proxyHint = getProxyUrl()
+      ? " The configured proxy may be unreachable or rejecting the connection."
+      : " If YouTube is blocked on your network, set the HTTPS_PROXY environment variable to route traffic through a proxy.";
+    return new Error(
+      `Failed to reach YouTube for video "${videoId}". This is likely a network/firewall issue.${proxyHint}`
+    );
+  }
+  return new Error(
+    `Failed to fetch YouTube transcript for "${videoId}": ${errorMessage(error)}`
   );
 }
 
@@ -91,60 +112,29 @@ async function fetchSegments(
   videoId: string,
   lang: string,
   fetchFn: typeof fetch
-): Promise<TranscriptSegment[]> {
+): Promise<TranscriptResult> {
   try {
-    return await YoutubeTranscript.fetchTranscript(videoId, {
-      lang,
-      fetch: fetchFn,
-    });
-  } catch (err: unknown) {
-    if (isTimeoutError(err)) {
-      const seconds = Math.round(getYoutubeTimeoutMs() / 1000);
-      throw new Error(
-        `YouTube transcript fetch timed out after ${seconds}s for video "${videoId}".`
-      );
+    const segments = await YoutubeTranscript.fetchTranscript(videoId, { lang, fetch: fetchFn });
+    return { segments, requestedLang: lang, usedFallback: false };
+  } catch (error: unknown) {
+    if (!(error instanceof YoutubeTranscriptNotAvailableLanguageError)) {
+      throw normalizeFetchError(error, videoId);
     }
+  }
 
-    if (!isLanguageMissingError(err)) {
-      if (isNetworkError(err)) {
-        const proxyHint = !getProxyUrl()
-          ? " If YouTube is blocked on your network, set the HTTPS_PROXY environment variable to route traffic through a proxy."
-          : " The configured proxy may be unreachable or rejecting the connection.";
-        throw new Error(
-          `Failed to reach YouTube for video "${videoId}". This is likely a network/firewall issue.${proxyHint}`
-        );
-      }
-      const message = err instanceof Error ? err.message : String(err);
-      throw new Error(
-        `Failed to fetch YouTube transcript for "${videoId}": ${message}`
-      );
-    }
-
-    try {
-      return await YoutubeTranscript.fetchTranscript(videoId, {
-        fetch: fetchFn,
-      });
-    } catch (fallbackErr: unknown) {
-      if (isTimeoutError(fallbackErr)) {
-        const seconds = Math.round(getYoutubeTimeoutMs() / 1000);
-        throw new Error(
-          `YouTube transcript fetch timed out after ${seconds}s for video "${videoId}".`
-        );
-      }
-      const message =
-        fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-      throw new Error(
-        `Could not fetch transcript for video "${videoId}": ${message}`
-      );
-    }
+  try {
+    const segments = await YoutubeTranscript.fetchTranscript(videoId, { fetch: fetchFn });
+    return { segments, requestedLang: lang, usedFallback: true };
+  } catch (error: unknown) {
+    throw normalizeFetchError(error, videoId);
   }
 }
 
 function formatChunks(
-  segments: TranscriptSegment[],
+  segments: TranscriptResponse[],
   chunkSeconds: number
 ): string {
-  const chunkDurationMs = chunkSeconds * 1000;
+  const chunkDurationMs = chunkSeconds * MS_PER_SECOND;
   const chunks: { timestamp: string; text: string }[] = [];
   let chunkText = "";
   let chunkStart = segments[0].offset;
@@ -152,10 +142,7 @@ function formatChunks(
   for (const seg of segments) {
     const elapsed = seg.offset - chunkStart;
     if (elapsed >= chunkDurationMs && chunkText.trim()) {
-      chunks.push({
-        timestamp: formatTimestamp(chunkStart),
-        text: chunkText.trim(),
-      });
+      chunks.push({ timestamp: formatTimestamp(chunkStart), text: chunkText.trim() });
       chunkText = seg.text;
       chunkStart = seg.offset;
     } else {
@@ -164,13 +151,16 @@ function formatChunks(
   }
 
   if (chunkText.trim()) {
-    chunks.push({
-      timestamp: formatTimestamp(chunkStart),
-      text: chunkText.trim(),
-    });
+    chunks.push({ timestamp: formatTimestamp(chunkStart), text: chunkText.trim() });
   }
 
   return chunks.map((c) => `**[${c.timestamp}]** ${c.text}`).join("\n\n");
+}
+
+function languageLine(result: TranscriptResult): string {
+  const actual = result.segments[0]?.lang ?? "unknown";
+  if (!result.usedFallback) return `**Language:** ${actual}`;
+  return `**Language:** ${actual} (requested "${result.requestedLang}" is not available)`;
 }
 
 export async function youtubeToMarkdown(
@@ -179,10 +169,9 @@ export async function youtubeToMarkdown(
   chunkSeconds = YOUTUBE_CHUNK_SECONDS_DEFAULT
 ): Promise<string> {
   const videoId = extractVideoId(urlOrId);
-  const fetchFn = buildFetch();
-  const segments = await fetchSegments(videoId, lang, fetchFn);
+  const result = await fetchSegments(videoId, lang, buildFetch());
 
-  if (!segments || segments.length === 0) {
+  if (result.segments.length === 0) {
     return "_No transcript available for this video._";
   }
 
@@ -191,8 +180,17 @@ export async function youtubeToMarkdown(
       ? chunkSeconds
       : YOUTUBE_CHUNK_SECONDS_DEFAULT;
 
-  const header = `# YouTube Transcript\n\n**Video ID:** ${videoId}  \n**URL:** https://www.youtube.com/watch?v=${videoId}\n\n---\n\n`;
-  const body = formatChunks(segments, safeChunkSeconds);
+  const header = [
+    "# YouTube Transcript",
+    "",
+    `**Video ID:** ${videoId}  `,
+    `**URL:** https://www.youtube.com/watch?v=${videoId}  `,
+    languageLine(result),
+    "",
+    "---",
+    "",
+    "",
+  ].join("\n");
 
-  return header + body;
+  return header + formatChunks(result.segments, safeChunkSeconds);
 }
