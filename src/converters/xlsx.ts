@@ -1,5 +1,5 @@
 import ExcelJS from "exceljs";
-import * as XLS from "xlsjs";
+import * as XLSX from "xlsx";
 import {
   OLE_MAGIC,
   XLSX_MAX_COLS,
@@ -7,175 +7,127 @@ import {
   ZIP_MAGIC,
 } from "../shared/constants.js";
 import { assertReadableFile, readFileBuffer } from "../shared/fs.js";
+import { hasMagic } from "../shared/magic.js";
 import { rowsToMarkdownTable } from "../shared/markdown.js";
 
-function startsWithMagic(buffer: Buffer, magic: Buffer): boolean {
-  return (
-    buffer.length >= magic.length &&
-    buffer.subarray(0, magic.length).equals(magic)
-  );
+interface SheetRows {
+  name: string;
+  rows: string[][];
+  truncated: boolean;
 }
 
-function formatDate(value: Date): string {
-  const y = value.getFullYear();
-  const m = String(value.getMonth() + 1).padStart(2, "0");
-  const d = String(value.getDate()).padStart(2, "0");
+const NO_SHEETS_MESSAGE = "_No worksheets found in this workbook._";
+
+// Both exceljs and SheetJS (with UTC: true) return dates at UTC midnight.
+// Local getters would shift the day for anyone west of UTC.
+export function formatDate(value: Date): string {
+  const y = value.getUTCFullYear();
+  const m = String(value.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(value.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
+}
+
+function scalarToString(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (value instanceof Date) return formatDate(value);
+  return String(value);
+}
+
+function objectCellToString(value: object): string {
+  if ("formula" in value || "sharedFormula" in value) {
+    const formula = value as
+      | ExcelJS.CellFormulaValue
+      | ExcelJS.CellSharedFormulaValue;
+    if (formula.result !== undefined && formula.result !== null) {
+      return scalarToString(formula.result);
+    }
+    return "formula" in formula && formula.formula ? `=${formula.formula}` : "";
+  }
+  if ("richText" in value && Array.isArray(value.richText)) {
+    return value.richText.map((part: ExcelJS.RichText) => part.text).join("");
+  }
+  if ("text" in value && typeof value.text === "string") return value.text;
+  if ("error" in value) return String(value.error);
+  return String(value);
 }
 
 function cellToString(cell: ExcelJS.Cell): string {
   const value = cell.value;
-
-  if (value === null || value === undefined) return "";
-
-  if (value instanceof Date) {
-    return formatDate(value);
+  if (value !== null && typeof value === "object" && !(value instanceof Date)) {
+    return objectCellToString(value);
   }
-
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-
-  if (typeof value === "string") {
-    return value;
-  }
-
-  if (typeof value === "object") {
-    if ("formula" in value || "sharedFormula" in value) {
-      const formula = value as
-        | ExcelJS.CellFormulaValue
-        | ExcelJS.CellSharedFormulaValue;
-      if (
-        "result" in formula &&
-        formula.result !== undefined &&
-        formula.result !== null
-      ) {
-        if (formula.result instanceof Date) {
-          return formatDate(formula.result);
-        }
-        return String(formula.result);
-      }
-      if ("formula" in formula && formula.formula) {
-        return `=${formula.formula}`;
-      }
-    }
-
-    if ("richText" in value && Array.isArray(value.richText)) {
-      return value.richText.map((part) => part.text).join("");
-    }
-
-    if ("text" in value && typeof value.text === "string") {
-      return value.text;
-    }
-
-    if ("error" in value) {
-      return String(value.error);
-    }
-  }
-
-  return String(value);
+  return scalarToString(value);
 }
 
-function sheetToRows(sheet: ExcelJS.Worksheet): {
-  rows: string[][];
-  truncated: boolean;
-} {
+function exceljsSheetToRows(sheet: ExcelJS.Worksheet): SheetRows {
   const rows: string[][] = [];
   let truncated = false;
-  let rowCount = 0;
 
   sheet.eachRow({ includeEmpty: false }, (row) => {
-    rowCount += 1;
-    if (rowCount > XLSX_MAX_ROWS) {
+    if (rows.length >= XLSX_MAX_ROWS) {
       truncated = true;
       return;
     }
-
-    const values: string[] = [];
-    const maxCol = Math.min(row.cellCount, XLSX_MAX_COLS);
     if (row.cellCount > XLSX_MAX_COLS) truncated = true;
-
+    const maxCol = Math.min(row.cellCount, XLSX_MAX_COLS);
+    const values: string[] = [];
     for (let col = 1; col <= maxCol; col++) {
       values.push(cellToString(row.getCell(col)));
     }
     rows.push(values);
   });
 
-  return { rows, truncated };
+  return { name: sheet.name, rows, truncated };
 }
 
-function limitRows(rawRows: unknown[][]): {
-  rows: string[][];
-  truncated: boolean;
-} {
+function limitRows(name: string, rawRows: unknown[][]): SheetRows {
   const truncated =
     rawRows.length > XLSX_MAX_ROWS ||
     rawRows.some((r) => r.length > XLSX_MAX_COLS);
-
-  const rows = rawRows.slice(0, XLSX_MAX_ROWS).map((row) =>
-    row.slice(0, XLSX_MAX_COLS).map((cell) => {
-      if (cell === null || cell === undefined) return "";
-      if (cell instanceof Date) return formatDate(cell);
-      return String(cell);
-    })
-  );
-
-  return { rows, truncated };
+  const rows = rawRows
+    .slice(0, XLSX_MAX_ROWS)
+    .map((row) => row.slice(0, XLSX_MAX_COLS).map(scalarToString));
+  return { name, rows, truncated };
 }
 
-function sectionsFromRows(
-  sheets: Array<{ name: string; rows: string[][]; truncated: boolean }>
-): string {
-  const sections: string[] = [];
+function sectionsFromRows(sheets: SheetRows[]): string {
+  if (sheets.length === 0) return NO_SHEETS_MESSAGE;
 
-  for (const sheet of sheets) {
+  const sections = sheets.map((sheet) => {
     if (sheet.rows.length === 0) {
-      sections.push(`## Sheet: ${sheet.name}\n\n_Empty sheet._`);
-      continue;
+      return `## Sheet: ${sheet.name}\n\n_Empty sheet._`;
     }
-
-    const table = rowsToMarkdownTable(sheet.rows);
     const notice = sheet.truncated
       ? `\n\n_Sheet truncated to ${XLSX_MAX_ROWS.toLocaleString()} rows / ${XLSX_MAX_COLS} columns._`
       : "";
-    sections.push(`## Sheet: ${sheet.name}\n\n${table}${notice}`);
-  }
+    return `## Sheet: ${sheet.name}\n\n${rowsToMarkdownTable(sheet.rows)}${notice}`;
+  });
 
   return sections.join("\n\n---\n\n").trim();
 }
 
-async function convertXlsx(absolutePath: string): Promise<string> {
+async function convertXlsx(buffer: Buffer): Promise<string> {
   const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.readFile(absolutePath);
-
-  if (workbook.worksheets.length === 0) {
-    return "_No worksheets found in this workbook._";
-  }
-
-  return sectionsFromRows(
-    workbook.worksheets.map((sheet) => {
-      const { rows, truncated } = sheetToRows(sheet);
-      return { name: sheet.name, rows, truncated };
-    })
-  );
+  // exceljs types predate Node's generic Buffer<ArrayBufferLike>.
+  await workbook.xlsx.load(buffer as unknown as ExcelJS.Buffer);
+  return sectionsFromRows(workbook.worksheets.map(exceljsSheetToRows));
 }
 
-async function convertXls(absolutePath: string): Promise<string> {
-  const workbook = XLS.readFile(absolutePath, { cellDates: true });
-  if (workbook.SheetNames.length === 0) {
-    return "_No worksheets found in this workbook._";
-  }
-
+function convertXls(buffer: Buffer): string {
+  const workbook = XLSX.read(buffer, {
+    type: "buffer",
+    cellDates: true,
+    UTC: true,
+  });
   return sectionsFromRows(
     workbook.SheetNames.map((name) => {
-      const sheet = workbook.Sheets[name];
-      const raw = XLS.utils.sheet_to_json(sheet, {
+      const raw = XLSX.utils.sheet_to_json<unknown[]>(workbook.Sheets[name], {
         header: 1,
         defval: "",
         blankrows: false,
+        UTC: true,
       });
-      const { rows, truncated } = limitRows(raw);
-      return { name, rows, truncated };
+      return limitRows(name, raw);
     })
   );
 }
@@ -184,16 +136,11 @@ export async function xlsxToMarkdown(filepath: string): Promise<string> {
   const absolutePath = await assertReadableFile(filepath, {
     extensions: [".xlsx", ".xlsm", ".xls"],
   });
-
   const buffer = await readFileBuffer(absolutePath);
 
-  // Detect by content: misnamed .xlsx that is still OLE/BIFF is common.
-  if (startsWithMagic(buffer, OLE_MAGIC)) {
-    return convertXls(absolutePath);
-  }
-  if (startsWithMagic(buffer, ZIP_MAGIC)) {
-    return convertXlsx(absolutePath);
-  }
+  // Detect by content: a misnamed .xlsx that is really OLE/BIFF is common.
+  if (hasMagic(buffer, OLE_MAGIC)) return convertXls(buffer);
+  if (hasMagic(buffer, ZIP_MAGIC)) return convertXlsx(buffer);
 
   throw new Error(
     "File does not look like a valid Excel workbook (expected OLE .xls or ZIP .xlsx/.xlsm)"

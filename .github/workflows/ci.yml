@@ -19,12 +19,8 @@ jobs:
         run: bun test
       - name: Build
         run: bun run build
-      # xlsjs pulls legacy SheetJS xlsx for .xls BIFF support only (no patched npm release).
       - name: Audit
-        run: >
-          bun audit --audit-level=high
-          --ignore=GHSA-4r6h-8v6p-xvw6
-          --ignore=GHSA-5pgg-2g8v-p4x9
+        run: bun audit --audit-level=high
 
   # npx users run the published package on Node, not Bun.
   node-smoke:

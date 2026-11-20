@@ -14,6 +14,7 @@ const TOOL_CALLS = [
   { name: "pdf_to_markdown", file: "sample.pdf", expect: "Hello PDF" },
   { name: "docx_to_markdown", file: "sample.docx", expect: "Hello Doc" },
   { name: "xlsx_to_markdown", file: "sample.xlsx", expect: "Ada" },
+  { name: "xlsx_to_markdown", file: "legacy.xls", expect: "2024-01-15" },
   { name: "pptx_to_markdown", file: "sample.pptx", expect: "Slide 1" },
 ];
 
