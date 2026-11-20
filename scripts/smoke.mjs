@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const FIXTURES = join(ROOT, "test", "fixtures");
+// Set SMOKE_SERVER to test an installed copy, e.g. node_modules/<pkg>/dist/index.js.
+const SERVER_ENTRY = process.env.SMOKE_SERVER ?? join(ROOT, "dist", "index.js");
 const RESPONSE_TIMEOUT_MS = 30_000;
 const PROTOCOL_VERSION = "2025-06-18";
 
@@ -19,7 +21,7 @@ const TOOL_CALLS = [
 ];
 
 function startServer() {
-  const child = spawn(process.execPath, [join(ROOT, "dist", "index.js")], {
+  const child = spawn(process.execPath, [SERVER_ENTRY], {
     stdio: ["pipe", "pipe", "inherit"],
   });
   const pending = new Map();
