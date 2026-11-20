@@ -90,6 +90,26 @@ function tableToMarkdown(table: Element): string {
   return parts.join("");
 }
 
+const IMAGE_PLACEHOLDER = "image";
+
+// Skip reading image bytes; mammoth's default inlines them as base64 data URIs,
+// which can exhaust the output limit with a few screenshots.
+const convertImageToPlaceholder = mammoth.images.imgElement(async () => ({
+  src: "",
+}));
+
+function escapeAltText(alt: string): string {
+  return alt.replace(/\s+/g, " ").replace(/([\\[\]])/g, "\\$1").trim();
+}
+
+turndown.addRule("imagePlaceholder", {
+  filter: "img",
+  replacement(_content, node) {
+    const alt = escapeAltText((node as Element).getAttribute("alt") ?? "");
+    return `![${alt || IMAGE_PLACEHOLDER}]`;
+  },
+});
+
 turndown.addRule("table", {
   filter: ["table"],
   replacement(_content, node) {
@@ -112,7 +132,10 @@ export async function docxToMarkdown(filepath: string): Promise<string> {
   const buffer = await readFileBuffer(absolutePath);
   assertMagic(buffer, [ZIP_MAGIC], "DOCX (ZIP/OOXML)");
 
-  const result = await mammoth.convertToHtml({ buffer });
+  const result = await mammoth.convertToHtml(
+    { buffer },
+    { convertImage: convertImageToPlaceholder }
+  );
   const markdown = turndown.turndown(result.value).trim();
 
   const warnings = result.messages
