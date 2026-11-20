@@ -4,6 +4,14 @@ import { assertMagic } from "../shared/magic.js";
 import { decodeXmlEntities } from "../shared/xml.js";
 import { unzipOfficePackage } from "../shared/zip.js";
 
+// Media (images, video, embedded workbooks) is never needed for text output.
+const TEXT_PART_PATTERN =
+  /^ppt\/(presentation\.xml|_rels\/presentation\.xml\.rels|slides\/(_rels\/)?slide\d+\.xml(\.rels)?|notesSlides\/notesSlide\d+\.xml)$/;
+
+function isTextPart(entryName: string): boolean {
+  return TEXT_PART_PATTERN.test(entryName);
+}
+
 function extractTextFromSlideXml(xml: string): string[] {
   const lines: string[] = [];
   const paragraphs = xml.match(/<a:p[\s>][\s\S]*?<\/a:p>/g) ?? [];
@@ -87,7 +95,9 @@ export async function pptxToMarkdown(filepath: string): Promise<string> {
   const fileBuffer = await readFileBuffer(absolutePath);
   assertMagic(fileBuffer, [ZIP_MAGIC], "PPTX (ZIP/OOXML)");
 
-  const zipEntries = unzipOfficePackage(fileBuffer);
+  const zipEntries = unzipOfficePackage(fileBuffer, {
+    include: isTextPart,
+  });
 
   const slideEntries = Object.entries(zipEntries)
     .filter(([path]) => /^ppt\/slides\/slide\d+\.xml$/.test(path))
